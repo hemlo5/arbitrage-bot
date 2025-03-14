@@ -7,17 +7,16 @@ import { IPool } from "@aave/core-v3/contracts/interfaces/IPool.sol";
 import { ISwapRouter } from "@uniswap/v3-periphery/contracts/interfaces/ISwapRouter.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import "@uniswap/v2-periphery/contracts/interfaces/IUniswapV2Router02.sol";
 
 contract FlashLoanArbitrage is ReentrancyGuard, Ownable {
     using SafeERC20 for IERC20;
 
     // Aave flashloan pool address on Arbitrum
     address public immutable aavePool;
-    // Uniswap V3 router on Arbitrum (SwapRouter02)
+    // Uniswap V3 router on Arbitrum
     ISwapRouter public immutable uniswapRouter;
-    // SushiSwap V2 router on Arbitrum
-    IUniswapV2Router02 public immutable sushiswapRouter;
+    // SushiSwap V3 router on Arbitrum
+    ISwapRouter public immutable sushiswapRouter;
     // Tokens for trading (e.g., tokenA = ARB, tokenB = WETH)
     address public immutable tokenA;
     address public immutable tokenB;
@@ -27,11 +26,12 @@ contract FlashLoanArbitrage is ReentrancyGuard, Ownable {
     event ArbitrageExecuted(uint256 profit, bool success);
 
     struct ArbitrageParams {
-        bool direction;       // True: SushiSwap V2 first, False: Uniswap V3 first
+        bool direction;       // True: SushiSwap V3 first, False: Uniswap V3 first
         uint256 minAmountOut1; // Minimum output for first swap
         uint256 minAmountOut2; // Minimum output for second swap
         uint256 deadline;      // Transaction deadline (unix timestamp)
-        uint24 fee1;           // Fee for Uniswap V3 swap (if applicable)
+        uint24 fee1;           // Fee for first swap (SushiSwap V3 or Uniswap V3)
+        uint24 fee2;           // Fee for second swap (Uniswap V3 or SushiSwap V3)
     }
 
     constructor(
@@ -44,7 +44,7 @@ contract FlashLoanArbitrage is ReentrancyGuard, Ownable {
     ) {
         aavePool = _aavePool;
         uniswapRouter = ISwapRouter(_uniswapRouter);
-        sushiswapRouter = IUniswapV2Router02(_sushiswapRouter);
+        sushiswapRouter = ISwapRouter(_sushiswapRouter);
         tokenA = _tokenA;
         tokenB = _tokenB;
         profitReceiver = _profitReceiver;
@@ -59,11 +59,12 @@ contract FlashLoanArbitrage is ReentrancyGuard, Ownable {
     /// @notice Initiates a flashloan arbitrage trade
     /// @param token The token to flashloan (e.g., ARB)
     /// @param amount The amount to flashloan
-    /// @param direction True: SushiSwap V2 -> Uniswap V3, False: Uniswap V3 -> SushiSwap V2
+    /// @param direction True: SushiSwap V3 -> Uniswap V3, False: Uniswap V3 -> SushiSwap V3
     /// @param minAmountOut1 Minimum output amount from the first swap
     /// @param minAmountOut2 Minimum output amount from the second swap
     /// @param deadline Deadline for the swap execution
-    /// @param fee1 Fee tier for Uniswap V3 swap (if applicable)
+    /// @param fee1 Fee tier for the first swap
+    /// @param fee2 Fee tier for the second swap
     function executeArbitrage(
         address token,
         uint256 amount,
@@ -71,14 +72,16 @@ contract FlashLoanArbitrage is ReentrancyGuard, Ownable {
         uint256 minAmountOut1,
         uint256 minAmountOut2,
         uint256 deadline,
-        uint24 fee1
+        uint24 fee1,
+        uint24 fee2
     ) external onlyOwner nonReentrant {
         ArbitrageParams memory params = ArbitrageParams(
             direction,
             minAmountOut1,
             minAmountOut2,
             deadline,
-            fee1
+            fee1,
+            fee2
         );
         IPool(aavePool).flashLoanSimple(address(this), token, amount, abi.encode(params), 0);
     }
@@ -99,24 +102,24 @@ contract FlashLoanArbitrage is ReentrancyGuard, Ownable {
         // Determine the output token for the first swap
         address outputToken = (asset == tokenA) ? tokenB : tokenA;
 
-        // First swap: SushiSwap V2 if direction=true, Uniswap V3 if false
+        // First swap: SushiSwap V3 if direction=true, Uniswap V3 if false
         uint256 received;
         if (arbParams.direction) {
-            // SushiSwap V2 swap
-            received = swapV2(asset, amount, outputToken, arbParams.minAmountOut1, arbParams.deadline);
+            // SushiSwap V3 swap
+            received = swapV3(sushiswapRouter, asset, amount, outputToken, arbParams.minAmountOut1, arbParams.deadline, arbParams.fee1);
         } else {
             // Uniswap V3 swap
-            received = swapV3(asset, amount, outputToken, arbParams.minAmountOut1, arbParams.deadline, arbParams.fee1);
+            received = swapV3(uniswapRouter, asset, amount, outputToken, arbParams.minAmountOut1, arbParams.deadline, arbParams.fee1);
         }
 
         // Second swap: Opposite DEX
         uint256 finalAmount;
         if (arbParams.direction) {
             // Uniswap V3 swap
-            finalAmount = swapV3(outputToken, received, asset, arbParams.minAmountOut2, arbParams.deadline, arbParams.fee1);
+            finalAmount = swapV3(uniswapRouter, outputToken, received, asset, arbParams.minAmountOut2, arbParams.deadline, arbParams.fee2);
         } else {
-            // SushiSwap V2 swap
-            finalAmount = swapV2(outputToken, received, asset, arbParams.minAmountOut2, arbParams.deadline);
+            // SushiSwap V3 swap
+            finalAmount = swapV3(sushiswapRouter, outputToken, received, asset, arbParams.minAmountOut2, arbParams.deadline, arbParams.fee2);
         }
 
         uint256 totalDebt = amount + premium;
@@ -133,8 +136,9 @@ contract FlashLoanArbitrage is ReentrancyGuard, Ownable {
         return true;
     }
 
-    /// @notice Executes a swap on Uniswap V3
+    /// @notice Executes a swap on a V3 DEX (Uniswap V3 or SushiSwap V3)
     function swapV3(
+        ISwapRouter router,
         address tokenIn,
         uint256 amountIn,
         address tokenOut,
@@ -145,9 +149,9 @@ contract FlashLoanArbitrage is ReentrancyGuard, Ownable {
         require(amountIn > 0, "Zero amount");
         require(deadline >= block.timestamp, "Expired deadline");
 
-        // Approve Uniswap router to spend tokenIn
-        IERC20(tokenIn).safeApprove(address(uniswapRouter), 0);
-        IERC20(tokenIn).safeApprove(address(uniswapRouter), amountIn);
+        // Approve the router to spend tokenIn
+        IERC20(tokenIn).safeApprove(address(router), 0);
+        IERC20(tokenIn).safeApprove(address(router), amountIn);
 
         ISwapRouter.ExactInputSingleParams memory params = ISwapRouter.ExactInputSingleParams({
             tokenIn: tokenIn,
@@ -160,36 +164,6 @@ contract FlashLoanArbitrage is ReentrancyGuard, Ownable {
             sqrtPriceLimitX96: 0
         });
 
-        return uniswapRouter.exactInputSingle(params);
-    }
-
-    /// @notice Executes a swap on SushiSwap V2
-    function swapV2(
-        address tokenIn,
-        uint256 amountIn,
-        address tokenOut,
-        uint256 minAmountOut,
-        uint256 deadline
-    ) internal returns (uint256) {
-        require(amountIn > 0, "Zero amount");
-        require(deadline >= block.timestamp, "Expired deadline");
-
-        // Approve SushiSwap router to spend tokenIn
-        IERC20(tokenIn).safeApprove(address(sushiswapRouter), 0);
-        IERC20(tokenIn).safeApprove(address(sushiswapRouter), amountIn);
-
-        address[] memory path = new address[](2);
-        path[0] = tokenIn;
-        path[1] = tokenOut;
-
-        uint256[] memory amounts = sushiswapRouter.swapExactTokensForTokens(
-            amountIn,
-            minAmountOut,
-            path,
-            address(this),
-            deadline
-        );
-
-        return amounts[1];
+        return router.exactInputSingle(params);
     }
 }
