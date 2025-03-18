@@ -8,10 +8,10 @@ const WETH_ADDRESS = "0x82af49447d8a07e3bd95bd0d56f35241523fbab1"; // WETH on Ar
 const UNISWAP_V3_POOL_ADDRESS = "0xc6f780497a95e246eb9449f5e4770916dcd6396a"; // Uniswap V3 ARB/WETH
 const SUSHISWAP_V3_POOL_ADDRESS = "0x99543bf98ca1830aa20d3eb12c1b9962f8eadc11"; // SushiSwap V3 ARB/WETH
 // Update this to the new contract address after redeploying with the correct SushiSwap V3 router
-const FLASHLOAN_ARBITRAGE_CONTRACT_ADDRESS = "0x3ce9c62a5671493802c7f58aa3dd3b1e491dcd7823785c234fc6516bba34d28f"; //oldone = 0x450B1c7Be913a47Fe1f0385A624e1F56AbdC54C6 // oldone2 = 0x29eFd8b99F7B298847ACFB423A39045F044a7027
-
+const FLASHLOAN_ARBITRAGE_CONTRACT_ADDRESS = "0xB92828aB890ECe71b86fc5ad2d826a8017b03485"; //oldone = 0x26C1B0ac65B0320375bf112a6357addebA2b7471 // the contract with logs = 0x905d24768aAA7b50DC796024C9196d3e8cdcB780
+// contract with logs + callback = 0xCF0c989bB50cD3EE52248191a4A65427aC85F66f
 const BORROW_VALUE_USD = 10; // Desired borrow amount in USD
-const ARBITRAGE_THRESHOLD = 0.00000035;
+const ARBITRAGE_THRESHOLD = .000000035;
 const MAX_ARBITRAGE_TRANSACTIONS = 1; // Stop after max arbitrage transactions
 const STOP_LOSS_USD = 2.5; // Stop when net loss reaches $2.5
 const CHAINLINK_ETH_USD_ADDRESS = "0x639Fe6ab55C921f74e7fac1ee960C0B6293ba612"; // Chainlink ETH/USD on Arbitrum
@@ -315,7 +315,7 @@ const checkArbitrage = (dex) => {
     console.log(`SushiSwap: 1 ARB = ${cachedSushiSwapPrice} WETH (≈$${(cachedSushiSwapPrice * cachedWethUsdPrice).toFixed(6)} USD)`);
     const direction = cachedSushiSwapPrice > cachedUniswapPrice;
     console.log(`Direction: ${direction ? "SushiSwap -> Uniswap" : "Uniswap -> SushiSwap"}`);
-    executePresignedArbitrage(direction, swapEventTimestamps[dex] || Date.now());
+    // executePresignedArbitrage(direction, swapEventTimestamps[dex] || Date.now());
   } else {
     if (arbOpportunityStartTime !== null) {
       const vanishTime = Date.now() - arbOpportunityStartTime;
@@ -395,7 +395,7 @@ const executePresignedArbitrage = async (direction, startTime) => {
     }
     console.log(`Fee factors - First: ${feeFactorFirst}, Second: ${feeFactorSecond}`);
 
-    const slippageTolerance = 0.99;
+    const slippageTolerance = 0.10;
     let minAmountOut1, minAmountOut2, expectedARBFloat;
 
     if (direction) {
@@ -445,11 +445,13 @@ const executePresignedArbitrage = async (direction, startTime) => {
     const totalDebtUSD = Number(totalDebtARB) * arbUsdPrice;
     console.log(`Total debt: ${totalDebtARB} ARB (≈$${totalDebtUSD.toFixed(2)} USD)`);
 
-    if (expectedFinalAmount <= totalDebt) {
-      console.log(`Expected final amount ${ethers.formatUnits(expectedFinalAmount, 18)} ARB (≈$${expectedFinalAmountUSD.toFixed(2)} USD) <= total debt ${ethers.formatUnits(totalDebt, 18)} ARB (≈$${totalDebtUSD.toFixed(2)} USD). Skipping transaction.`);
-      executingTransactions--;
-      return;
-    }
+    // if (expectedFinalAmount <= totalDebt) {
+          console.log(`Expected final amount ${ethers.formatUnits(expectedFinalAmount, 18)} ARB (≈$${expectedFinalAmountUSD.toFixed(2)} USD) <= total debt ${ethers.formatUnits(totalDebt, 18)} ARB (≈$${totalDebtUSD.toFixed(2)} USD). Skipping transaction.`);
+          executingTransactions--;
+          return;
+        }
+
+
 
     const deadline = Math.floor(Date.now() / 1000) + 45;
     const feeFirst = direction ? cachedSushiSwapFee : cachedUniswapFee;
@@ -513,12 +515,6 @@ const executePresignedArbitrage = async (direction, startTime) => {
     try {
       signedTx = await signer.signTransaction(tx);
       console.log(`Signed transaction: ${signedTx}`);
-      // To debug this transaction with Tenderly:
-      // 1. Copy the signed transaction hex above (starting with "0x...")
-      // 2. Go to https://dashboard.tenderly.co/simulator
-      // 3. Select network: Arbitrum
-      // 4. Paste the signed transaction hex into the "Transaction" field
-      // 5. Click "Simulate" to see the execution trace and identify where it fails
     } catch (signError) {
       console.error("Failed to sign transaction:", signError.message);
       throw new Error(`Signing failed: ${signError.message}`);
@@ -553,12 +549,47 @@ const executePresignedArbitrage = async (direction, startTime) => {
         throw new Error("No receipt received");
       }
       console.log(`Transaction receipt received - Status: ${receipt.status}`);
+      // Log the full receipt structure, handling BigInt for JSON serialization
+      console.log("Receipt:", JSON.stringify(receipt, (key, value) => typeof value === 'bigint' ? value.toString() : value, 2));
     } catch (waitError) {
       console.error("Failed to wait for transaction confirmation:", waitError.message);
       throw new Error(`Confirmation wait failed: ${waitError.message}`);
     }
 
     if (receipt) {
+      // Handle missing transactionHash by logging available keys if undefined
+      if (!receipt.transactionHash) {
+        console.log("Receipt keys:", Object.keys(receipt));
+      }
+      // Use fallback 'unknown' if transactionHash is missing
+      console.log(`📜 Transaction logs for TX: ${receipt.transactionHash || 'unknown'}`);
+      // Log the number of logs to confirm if any exist
+      console.log("Number of logs:", receipt.logs.length);
+
+      // Check logs availability and proceed accordingly
+      if (receipt.logs.length === 0) {
+        console.log("No logs emitted before revert.");
+      } else {
+        for (const log of receipt.logs) {
+          try {
+            const parsedLog = flashLoanArbitrage.interface.parseLog(log);
+            console.log(`Event: ${parsedLog.name}`);
+            parsedLog.fragment.inputs.forEach((input, index) => {
+              const argName = input.name || `arg${index}`; // Fallback if name is missing
+              let argValue = parsedLog.args[index];
+              if (typeof argValue === 'bigint') {
+                argValue = argValue.toString();
+              } else {
+                argValue = argValue.toString();
+              }
+              console.log(`  ${argName}: ${argValue}`);
+            });
+          } catch (e) {
+            console.log("Log skipped (not from contract):", log);
+          }
+        }
+      }
+
       let profitInARB = 0n;
       let success = false;
       if (receipt.status === 1) {
